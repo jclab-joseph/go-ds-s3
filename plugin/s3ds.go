@@ -98,11 +98,9 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			}
 		}
 
-		var keyTransform string
+		keyTransform := "default"
 		if v, ok := m["keyTransform"]; ok {
-			if v == "" {
-				keyTransform = "default"
-			} else {
+			if v != "" {
 				keyTransform, ok = v.(string)
 				if !ok {
 					return nil, fmt.Errorf("s3ds: keyTransform is not a valid key transform method")
@@ -136,6 +134,7 @@ func (s3c *S3Config) DiskSpec() fsrepo.DiskSpec {
 		"region":        s3c.cfg.Region,
 		"bucket":        s3c.cfg.Bucket,
 		"rootDirectory": s3c.cfg.RootDirectory,
+		"keyTransform":  s3c.cfg.KeyTransform,
 	}
 }
 
