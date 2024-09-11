@@ -141,10 +141,7 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 		if cacheImpl.MaxSize <= 0 {
 			info, err := disk.GetInfo(conf.CacheDirectory, false)
 			if err == nil {
-				cacheImpl.MaxSize = int64(info.Total) - 1024*1024*1024
-				if cacheImpl.MaxSize <= 0 {
-					cacheImpl.MaxSize = int64(info.Total)
-				}
+				cacheImpl.MaxSize = int64(float64(info.Total) * 0.8)
 				log.Printf("[go-ds-s3] cache capacity is automatically set to %.2f GB", float64(cacheImpl.MaxSize)/filecache.Gigabyte)
 			} else {
 				cacheImpl.MaxSize = filecache.Gigabyte
