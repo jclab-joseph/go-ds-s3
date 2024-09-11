@@ -108,6 +108,22 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			}
 		}
 
+		var cacheDirectory string
+		if v, ok := m["cacheDirectory"]; ok {
+			cacheDirectory, ok = v.(string)
+			if !ok {
+				return nil, fmt.Errorf("s3ds: cacheDirectory not a string")
+			}
+		}
+
+		var cacheCapacity int64 = 0
+		if v, ok := m["cacheCapacity"]; ok {
+			cacheCapacity, ok = v.(int64)
+			if !ok {
+				return nil, fmt.Errorf("s3ds: cacheCapacity not a int64")
+			}
+		}
+
 		return &S3Config{
 			cfg: s3ds.Config{
 				Region:              region,
@@ -120,6 +136,8 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 				RegionEndpoint:      endpoint,
 				CredentialsEndpoint: credentialsEndpoint,
 				KeyTransform:        keyTransform,
+				CacheDirectory:      cacheDirectory,
+				CacheCapacity:       cacheCapacity,
 			},
 		}, nil
 	}

@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/ipfs/go-ds-s3/pkg/filecache"
+	disk "github.com/naughtyGitCat/minio-disk"
 	"io"
+	"log"
 	"os"
 	"path"
 	"strings"
@@ -46,7 +49,8 @@ var _ ds.Datastore = (*S3Bucket)(nil)
 
 type S3Bucket struct {
 	Config
-	S3 *s3.S3
+	S3    *s3.S3
+	Cache filecache.FileCache
 }
 
 type Config struct {
@@ -60,6 +64,8 @@ type Config struct {
 	Workers             int
 	CredentialsEndpoint string
 	KeyTransform        string
+	CacheDirectory      string
+	CacheCapacity       int64
 }
 
 var KeyTransforms = map[string]func(ds.Key) string{
@@ -127,9 +133,37 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 	}
 	s3obj := s3.New(sess)
 
+	var cache filecache.FileCache
+	if conf.CacheDirectory != "" {
+		cacheImpl := filecache.NewDefaultCache(conf.CacheDirectory, nil, filecache.DefaultCacheComparer)
+		cacheImpl.MaxItems = 262144
+		cacheImpl.MaxSize = conf.CacheCapacity
+		if cacheImpl.MaxSize <= 0 {
+			info, err := disk.GetInfo(conf.CacheDirectory, false)
+			if err == nil {
+				cacheImpl.MaxSize = int64(info.Total) - 1024*1024*1024
+				if cacheImpl.MaxSize <= 0 {
+					cacheImpl.MaxSize = int64(info.Total)
+				}
+				log.Printf("[go-ds-s3] cache capacity is automatically set to %.2f GB", float64(cacheImpl.MaxSize)/filecache.Gigabyte)
+			} else {
+				cacheImpl.MaxSize = filecache.Gigabyte
+				log.Printf("[go-ds-s3] could not get disk info for cache directory(%s): %+v", conf.CacheDirectory, err)
+			}
+		}
+		cache = cacheImpl
+	} else {
+		cache = filecache.NewNoop()
+	}
+	if err = cache.Start(); err != nil {
+		log.Printf("[go-ds-s3] cache(%s) failed to start: %+v", conf.CacheDirectory, err)
+		cache = filecache.NewNoop()
+	}
+
 	return &S3Bucket{
 		S3:     s3obj,
 		Config: conf,
+		Cache:  cache,
 	}, nil
 }
 
@@ -150,11 +184,33 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	var err error
 	var resp *s3.GetObjectOutput
 	keys := prepareKeyWithFallback(s.Config, k)
-	for _, key := range keys {
+
+	cachedFile, cerr := s.Cache.Open(keys[0])
+	if cerr == nil {
+		body, cerr := io.ReadAll(cachedFile)
+		if cerr == nil {
+			return body, nil
+		}
+	}
+
+	var body []byte
+	for index, key := range keys {
 		resp, err = s.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(s.Bucket),
 			Key:    aws.String(s.s3Path(key)),
 		})
+
+		if err == nil {
+			body, err = io.ReadAll(resp.Body)
+		}
+		if index == 1 && err == nil {
+			_, _ = s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(s.Bucket),
+				Key:    aws.String(s.s3Path(prepareKey(s.Config, k))),
+				Body:   bytes.NewReader(body),
+			})
+		}
+
 		if err == nil || !isNotFound(err) {
 			break
 		}
@@ -167,7 +223,17 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 
-	return io.ReadAll(resp.Body)
+	writer, cerr := s.Cache.Create(keys[0])
+	if cerr == nil {
+		_, cerr = writer.Write(body)
+		if cerr != nil {
+			writer.Cancel()
+		} else {
+			writer.Close()
+		}
+	}
+
+	return body, nil
 }
 
 func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
@@ -205,6 +271,9 @@ func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) 
 func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
 	var err error
 	keys := prepareKeyWithFallback(s.Config, k)
+
+	s.Cache.Remove(keys[0])
+
 	for _, key := range keys {
 		_, err = s.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(s.Bucket),
