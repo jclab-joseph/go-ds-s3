@@ -7,7 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/ipfs/go-ds-s3/pkg/filecache"
-	disk "github.com/naughtyGitCat/minio-disk"
+	disk "github.com/ipfs/go-ds-s3/pkg/minio-disk"
 	"io"
 	"log"
 	"os"
