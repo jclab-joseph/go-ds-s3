@@ -77,6 +77,7 @@ var KeyTransforms = map[string]func(ds.Key) string{
 	},
 	"next-to-last/2": func(k ds.Key) string {
 		s := k.String()
+		s, _ = strings.CutPrefix(s, "/")
 		offset := 1
 		start := len(s) - 2 - offset
 		return s[start:start+2] + "/" + s
@@ -257,7 +258,7 @@ func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) 
 		}
 	}
 	if err != nil {
-		if s3Err, ok := err.(awserr.Error); ok && s3Err.Code() == "NotFound" {
+		if isNotFound(err) {
 			return -1, ds.ErrNotFound
 		}
 		return -1, err
@@ -384,7 +385,7 @@ func (s *S3Bucket) s3Path(p string) string {
 
 func isNotFound(err error) bool {
 	s3Err, ok := err.(awserr.Error)
-	return ok && s3Err.Code() == s3.ErrCodeNoSuchKey
+	return ok && (s3Err.Code() == s3.ErrCodeNoSuchKey || s3Err.Code() == "NotFound")
 }
 
 type s3Batch struct {

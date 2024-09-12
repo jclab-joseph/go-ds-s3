@@ -5,7 +5,7 @@ go 1.22
 toolchain go1.22.0
 
 require (
-	github.com/aws/aws-sdk-go v1.45.24
+	github.com/aws/aws-sdk-go v1.55.5
 	github.com/ipfs/go-datastore v0.6.0
 	github.com/ipfs/kubo v0.28.0
 	github.com/ncw/directio v1.0.5
