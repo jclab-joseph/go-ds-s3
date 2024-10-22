@@ -3,6 +3,7 @@ package s3ds
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/service/sts"
@@ -166,11 +167,16 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 }
 
 func (s *S3Bucket) Put(ctx context.Context, k ds.Key, value []byte) error {
+	key := prepareKey(s.Config, k)
+
 	_, err := s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
-		Key:    aws.String(s.s3Path(prepareKey(s.Config, k))),
+		Key:    aws.String(s.s3Path(key)),
 		Body:   bytes.NewReader(value),
 	})
+	if err == nil {
+		s.writeToCache(key, value)
+	}
 	return err
 }
 
@@ -200,6 +206,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 
 		if err == nil {
 			body, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
 		}
 		if index == 1 && err == nil {
 			_, _ = s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
@@ -219,17 +226,8 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 		}
 		return nil, err
 	}
-	defer resp.Body.Close()
 
-	writer, cerr := s.Cache.Create(keys[0])
-	if cerr == nil {
-		_, cerr = writer.Write(body)
-		if cerr != nil {
-			writer.Cancel()
-		} else {
-			writer.Close()
-		}
-	}
+	s.writeToCache(keys[0], body)
 
 	return body, nil
 }
@@ -237,7 +235,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
 	_, err = s.GetSize(ctx, k)
 	if err != nil {
-		if err == ds.ErrNotFound {
+		if errors.Is(err, ds.ErrNotFound) {
 			return false, nil
 		}
 		return false, err
@@ -248,6 +246,7 @@ func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
 func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) {
 	var resp *s3.HeadObjectOutput
 	keys := prepareKeyWithFallback(s.Config, k)
+
 	for _, key := range keys {
 		resp, err = s.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(s.Bucket),
@@ -286,6 +285,21 @@ func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
 		err = nil
 	}
 	return err
+}
+
+func (s *S3Bucket) writeToCache(k string, data []byte) {
+	writer, err := s.Cache.Create(k)
+	if err != nil {
+		log.Printf("[S3 Cache] create failed: %+v", err)
+		return
+	}
+	_, err = writer.Write(data)
+	if err != nil {
+		log.Printf("[S3 Cache] write failed: %+v", err)
+		writer.Cancel()
+	} else {
+		writer.Close()
+	}
 }
 
 func prepareKey(cfg Config, k ds.Key) string {
@@ -384,7 +398,8 @@ func (s *S3Bucket) s3Path(p string) string {
 }
 
 func isNotFound(err error) bool {
-	s3Err, ok := err.(awserr.Error)
+	var s3Err awserr.Error
+	ok := errors.As(err, &s3Err)
 	return ok && (s3Err.Code() == s3.ErrCodeNoSuchKey || s3Err.Code() == "NotFound")
 }
 
