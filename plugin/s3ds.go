@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"fmt"
+	"reflect"
 
 	s3ds "github.com/ipfs/go-ds-s3"
 	"github.com/ipfs/kubo/plugin"
@@ -118,9 +119,15 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 
 		var cacheCapacity int64 = 0
 		if v, ok := m["cacheCapacity"]; ok {
-			cacheCapacity, ok = v.(int64)
-			if !ok {
-				return nil, fmt.Errorf("s3ds: cacheCapacity not a int64")
+			switch typed := v.(type) {
+			case int:
+				cacheCapacity = int64(typed)
+			case int64:
+				cacheCapacity = typed
+			case float64:
+				cacheCapacity = int64(typed)
+			default:
+				return nil, fmt.Errorf("s3ds: cacheCapacity not a integer: %s", reflect.TypeOf(v))
 			}
 		}
 
