@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/ipfs/boxo/datastore/dshelp"
+	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-ds-s3/pkg/filecache"
 	disk "github.com/ipfs/go-ds-s3/pkg/minio-disk"
+	golog "github.com/ipfs/go-log/v2"
 	"io"
-	"log"
 	"os"
 	"path"
 	"strings"
@@ -45,6 +47,8 @@ const (
 	// earliest time the endpoint creds can be refreshed.
 	credsRefreshWindow = 2 * time.Minute
 )
+
+var logging = golog.Logger("go-ds-s3")
 
 var _ ds.Datastore = (*S3Bucket)(nil)
 
@@ -83,6 +87,11 @@ var KeyTransforms = map[string]func(ds.Key) string{
 		start := len(s) - 2 - offset
 		return s[start:start+2] + "/" + s
 	},
+}
+
+func printCid(k ds.Key) string {
+	h, _ := dshelp.DsKeyToMultihash(k)
+	return fmt.Sprintf("key: %s (DagProtobuf: %s | Raw: %s)", k.String(), cid.NewCidV1(cid.DagProtobuf, h), cid.NewCidV1(cid.Raw, h))
 }
 
 func NewS3Datastore(conf Config) (*S3Bucket, error) {
@@ -144,10 +153,10 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 			info, err := disk.GetInfo(conf.CacheDirectory, false)
 			if err == nil {
 				cacheImpl.MaxSize = int64(float64(info.Total) * 0.8)
-				log.Printf("[go-ds-s3] cache capacity is automatically set to %.2f GB", float64(cacheImpl.MaxSize)/filecache.Gigabyte)
+				logging.Infof("[go-ds-s3] cache capacity is automatically set to %.2f GB", float64(cacheImpl.MaxSize)/filecache.Gigabyte)
 			} else {
 				cacheImpl.MaxSize = filecache.Gigabyte
-				log.Printf("[go-ds-s3] could not get disk info for cache directory(%s): %+v", conf.CacheDirectory, err)
+				logging.Infof("[go-ds-s3] could not get disk info for cache directory(%s): %+v", conf.CacheDirectory, err)
 			}
 		}
 		cache = cacheImpl
@@ -155,7 +164,7 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 		cache = filecache.NewNoop()
 	}
 	if err = cache.Start(); err != nil {
-		log.Printf("[go-ds-s3] cache(%s) failed to start: %+v", conf.CacheDirectory, err)
+		logging.Infof("[go-ds-s3] cache(%s) failed to start: %+v", conf.CacheDirectory, err)
 		cache = filecache.NewNoop()
 	}
 
@@ -188,6 +197,8 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	var err error
 	var resp *s3.GetObjectOutput
 	keys := prepareKeyWithFallback(s.Config, k)
+
+	logging.Debugf("Get %s", printCid(k))
 
 	cachedFile, cerr := s.Cache.Open(keys[0])
 	if cerr == nil {
@@ -222,6 +233,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 	}
 	if err != nil {
 		if isNotFound(err) {
+			logging.Debugf("Get NotFound %s", printCid(k))
 			return nil, ds.ErrNotFound
 		}
 		return nil, err
@@ -246,6 +258,8 @@ func (s *S3Bucket) Has(ctx context.Context, k ds.Key) (exists bool, err error) {
 func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) {
 	var resp *s3.HeadObjectOutput
 	keys := prepareKeyWithFallback(s.Config, k)
+
+	logging.Debugf("GetSize %s", printCid(k))
 
 	for _, key := range keys {
 		resp, err = s.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
@@ -290,12 +304,12 @@ func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
 func (s *S3Bucket) writeToCache(k string, data []byte) {
 	writer, err := s.Cache.Create(k)
 	if err != nil {
-		log.Printf("[S3 Cache] create failed: %+v", err)
+		logging.Infof("cache create failed: %+v", err)
 		return
 	}
 	_, err = writer.Write(data)
 	if err != nil {
-		log.Printf("[S3 Cache] write failed: %+v", err)
+		logging.Infof("cache write failed: %+v", err)
 		writer.Cancel()
 	} else {
 		writer.Close()
@@ -316,6 +330,7 @@ func prepareKeyWithFallback(cfg Config, k ds.Key) []string {
 
 func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) {
 	if q.Orders != nil || q.Filters != nil {
+		logging.Infof("s3ds: filters or orders are not supported")
 		return nil, fmt.Errorf("s3ds: filters or orders are not supported")
 	}
 
@@ -326,6 +341,8 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 	if limit == 0 || limit > listMax {
 		limit = listMax
 	}
+
+	logging.Debugf("Query ds prefix: %v", q.Prefix)
 
 	resp, err := s.S3.ListObjectsV2WithContext(ctx, &s3.ListObjectsV2Input{
 		Bucket:  aws.String(s.Bucket),
