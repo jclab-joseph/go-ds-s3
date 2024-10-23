@@ -2,6 +2,7 @@ package filecache
 
 import (
 	"errors"
+	golog "github.com/ipfs/go-log/v2"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -75,6 +76,8 @@ type FileCacheImpl struct {
 	GCPeriod time.Duration // Run an expiration check GCPeriod seconds
 }
 
+var logging = golog.Logger("filecache")
+
 // NewDefaultCache returns a new FileCache with sane defaults.
 func NewDefaultCache(directory string, checkExpire CheckExpired, cacheComparer CacheComparer) *FileCacheImpl {
 	return &FileCacheImpl{
@@ -113,7 +116,8 @@ func (cache *FileCacheImpl) Start() error {
 	cache.items = make(map[string]CacheItem)
 	cache.shutdown = make(chan interface{}, 1)
 	os.MkdirAll(cache.Directory, 0700)
-	cache.loadExisting()
+	cache.capacity = 0
+	go cache.loadExisting()
 	go cache.gcWorker()
 	return nil
 }
@@ -220,8 +224,19 @@ func (cache *FileCacheImpl) Stop() {
 }
 
 func (cache *FileCacheImpl) loadExisting() {
-	cache.capacity = 0
+	logging.Infof("[go-ds-s3] load existing start")
 
+	bulkOp := func(items []CacheItem) {
+		cache.mutex.Lock()
+		defer cache.mutex.Unlock()
+
+		for _, item := range items {
+			cache.capacity += item.Size()
+			cache.items[item.Name()] = item
+		}
+	}
+
+	bufferedItems := make([]CacheItem, 0, 100)
 	filepath.WalkDir(cache.Directory, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -231,20 +246,25 @@ func (cache *FileCacheImpl) loadExisting() {
 		if err != nil {
 			return nil
 		}
-		fi, err := d.Info()
-		if err != nil {
-			return nil
-		}
 
-		cache.capacity += fi.Size()
 		item, err := cache.CacheFile(name, path)
 		if err != nil {
+			logging.Infof("[go-ds-s3] cache file failed: %+v", err)
 			return nil
 		}
-		cache.items[name] = item
+		bufferedItems = append(bufferedItems, item)
+		if len(bufferedItems) >= 100 {
+			bulkOp(bufferedItems)
+			bufferedItems = make([]CacheItem, 0, 100)
+		}
 
 		return nil
 	})
+	if len(bufferedItems) > 0 {
+		bulkOp(bufferedItems)
+	}
+
+	logging.Infof("[go-ds-s3] load existing done")
 }
 
 func (cache *FileCacheImpl) isCacheNull() bool {
