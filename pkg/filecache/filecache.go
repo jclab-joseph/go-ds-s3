@@ -100,6 +100,8 @@ func NewDefaultCache(directory string, checkExpire CheckExpired, cacheComparer C
 // automatic cache expiration goroutines and initialise the internal
 // data structures.
 func (cache *FileCacheImpl) Start() error {
+	cache.Stop()
+
 	if cache.CacheComparer == nil {
 		cache.CacheComparer = DefaultCacheComparer
 	}
@@ -108,17 +110,24 @@ func (cache *FileCacheImpl) Start() error {
 			return DefaultCacheFile(&realClock{}, name, path)
 		}
 	}
-
-	if cache.shutdown != nil {
-		close(cache.shutdown)
+	if cache.clock == nil {
+		cache.clock = &realClock{}
+	}
+	if err := os.MkdirAll(cache.Directory, 0700); err != nil {
+		return err
 	}
 
+	shutdown := make(chan interface{})
+
+	cache.mutex.Lock()
 	cache.items = make(map[string]CacheItem)
-	cache.shutdown = make(chan interface{}, 1)
-	os.MkdirAll(cache.Directory, 0700)
+	cache.shutdown = shutdown
 	cache.capacity = 0
-	go cache.loadExisting()
-	go cache.gcWorker()
+	cache.mutex.Unlock()
+
+	cache.wait.Add(2)
+	go cache.loadExisting(shutdown)
+	go cache.gcWorker(shutdown)
 	return nil
 }
 
@@ -179,6 +188,8 @@ func (cache *FileCacheImpl) ExpireOldest(purgeCount int, purgeSize int64) bool {
 
 // IsActive returns true if the cache has been started, and false otherwise.
 func (cache *FileCacheImpl) IsActive() bool {
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
 	return !cache.isCacheNull()
 }
 
@@ -209,35 +220,56 @@ func (cache *FileCacheImpl) GetCache(name string) CacheItem {
 // If there are any items or cache operations ongoing while Stop() is called,
 // it is undefined how they will behave.
 func (cache *FileCacheImpl) Stop() {
-	if cache.shutdown != nil {
-		close(cache.shutdown)
-		<-time.After(1 * time.Microsecond) // give goroutines time to shutdown
-	}
+	cache.mutex.Lock()
+	shutdown := cache.shutdown
+	cache.shutdown = nil
+	cache.mutex.Unlock()
 
-	if cache.items != nil {
-		cache.mutex.Lock()
-		cache.items = nil
-		cache.mutex.Unlock()
+	if shutdown != nil {
+		close(shutdown)
 	}
 
 	cache.wait.Wait()
+
+	cache.mutex.Lock()
+	cache.items = nil
+	cache.capacity = 0
+	cache.mutex.Unlock()
 }
 
-func (cache *FileCacheImpl) loadExisting() {
+func (cache *FileCacheImpl) loadExisting(shutdown <-chan interface{}) {
+	defer cache.wait.Done()
+
 	logging.Infof("[go-ds-s3] load existing start")
 
-	bulkOp := func(items []CacheItem) {
+	bulkOp := func(items []CacheItem) bool {
+		select {
+		case <-shutdown:
+			return false
+		default:
+		}
+
 		cache.mutex.Lock()
 		defer cache.mutex.Unlock()
+		if cache.items == nil {
+			return false
+		}
 
 		for _, item := range items {
 			cache.capacity += item.Size()
 			cache.items[item.Name()] = item
 		}
+		return true
 	}
 
 	bufferedItems := make([]CacheItem, 0, 100)
 	filepath.WalkDir(cache.Directory, func(path string, d fs.DirEntry, err error) error {
+		select {
+		case <-shutdown:
+			return fs.SkipAll
+		default:
+		}
+
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -254,7 +286,9 @@ func (cache *FileCacheImpl) loadExisting() {
 		}
 		bufferedItems = append(bufferedItems, item)
 		if len(bufferedItems) >= 100 {
-			bulkOp(bufferedItems)
+			if !bulkOp(bufferedItems) {
+				return fs.SkipAll
+			}
 			bufferedItems = make([]CacheItem, 0, 100)
 		}
 
@@ -407,23 +441,27 @@ func (cache *FileCacheImpl) expireOldest(purgeCount int, purgeSize int64) bool {
 // gcWorker is a background goroutine responsible for cleaning the cache.
 // It runs periodically, every cache.GCPeriod seconds. If cache.GCPeriod is set
 // to 0, it will not run.
-func (cache *FileCacheImpl) gcWorker() {
+func (cache *FileCacheImpl) gcWorker(shutdown <-chan interface{}) {
+	defer cache.wait.Done()
+
 	if cache.GCPeriod <= 0 {
 		return
 	}
 
-	cache.wait.Add(1)
-	defer cache.wait.Done()
-
 	for {
 		select {
-		case _ = <-cache.shutdown:
+		case <-shutdown:
 			return
 		case <-cache.clock.After(cache.GCPeriod):
+			cache.mutex.Lock()
 			if cache.isCacheNull() {
+				cache.mutex.Unlock()
 				return
 			}
-			cache.ExpireOldest(len(cache.items)-cache.MaxItems, cache.capacity-cache.MaxSize)
+			purgeCount := len(cache.items) - cache.MaxItems
+			purgeSize := cache.capacity - cache.MaxSize
+			cache.mutex.Unlock()
+			cache.ExpireOldest(purgeCount, purgeSize)
 		}
 	}
 }

@@ -1,15 +1,20 @@
 package filecache
 
 import (
+	"sync"
 	"time"
 )
 
 type fakeClock struct {
+	mutex sync.RWMutex
 	delay time.Duration
 }
 
 func (c *fakeClock) Now() time.Time {
-	return time.Now().Add(c.delay)
+	c.mutex.RLock()
+	delay := c.delay
+	c.mutex.RUnlock()
+	return time.Now().Add(delay)
 }
 
 func (c *fakeClock) Since(t time.Time) time.Duration {
@@ -36,6 +41,8 @@ func (c *fakeClock) Sleep(t time.Duration) {
 	if t < minimalDelay {
 		minimalDelay = t
 	}
+	c.mutex.Lock()
 	c.delay += t - minimalDelay
+	c.mutex.Unlock()
 	time.Sleep(minimalDelay) // allow to execute other go-routine
 }
