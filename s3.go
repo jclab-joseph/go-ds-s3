@@ -21,8 +21,6 @@ import (
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
-	"github.com/ipfs/boxo/datastore/dshelp"
-	"github.com/ipfs/go-cid"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	"github.com/ipfs/go-ds-s3/pkg/filecache"
@@ -95,11 +93,6 @@ var KeyTransforms = map[string]func(ds.Key) string{
 		start := len(s) - 2 - offset
 		return s[start:start+2] + "/" + s
 	},
-}
-
-func printCid(k ds.Key) string {
-	h, _ := dshelp.DsKeyToMultihash(k)
-	return fmt.Sprintf("key: %s (DagProtobuf: %s | Raw: %s)", k.String(), cid.NewCidV1(cid.DagProtobuf, h), cid.NewCidV1(cid.Raw, h))
 }
 
 func NewS3Datastore(conf Config) (*S3Bucket, error) {

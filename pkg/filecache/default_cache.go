@@ -46,7 +46,7 @@ func DefaultCacheFile(clock Clock, name string, path string) (itm CacheItem, err
 	if err != nil {
 		return
 	} else if fi.Mode().IsDir() {
-		return nil, ItemIsDirectory
+		return nil, ErrItemIsDirectory
 	}
 
 	itm = &cacheItem{

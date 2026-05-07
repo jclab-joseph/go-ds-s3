@@ -208,6 +208,8 @@ func TestExpireOldestOverItem(t *testing.T) {
 		names = append(names, name)
 	}
 
+	_ = names
+
 	if !t.Failed() && cache.Count() > cache.MaxItems {
 		fmt.Println("failed")
 		fmt.Printf("[!] %d items in cache (limit should be %d)", cache.Count(), cache.MaxItems)
@@ -255,6 +257,8 @@ func TestExpireOldestOverSize(t *testing.T) {
 		}
 		names = append(names, name)
 	}
+
+	_ = names
 
 	if !t.Failed() && cache.Count() > 4 {
 		fmt.Println("failed")

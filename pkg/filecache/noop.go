@@ -23,7 +23,7 @@ func (n *noopFileCache) IsActive() bool {
 func (n *noopFileCache) Open(name string) (*os.File, error) {
 	f, err := os.Open(name)
 	if err != nil && os.IsNotExist(err) {
-		return nil, ItemNotInCache
+		return nil, ErrItemNotInCache
 	}
 	return f, err
 }

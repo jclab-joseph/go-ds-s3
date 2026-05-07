@@ -2,13 +2,14 @@ package filecache
 
 import (
 	"errors"
-	golog "github.com/ipfs/go-log/v2"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 	"time"
+
+	golog "github.com/ipfs/go-log/v2"
 )
 
 // File size constants for use with FileCache.MaxSize.
@@ -26,9 +27,9 @@ var (
 )
 
 var (
-	ItemIsDirectory = errors.New("can't cache a Directory")
-	ItemNotInCache  = errors.New("item not in cache")
-	ItemTooLarge    = errors.New("item too large for cache")
+	ErrItemIsDirectory = errors.New("can't cache a Directory")
+	ErrItemNotInCache  = errors.New("item not in cache")
+	ErrItemTooLarge    = errors.New("item too large for cache")
 )
 
 // CacheItem Immutable Cache Item
@@ -136,7 +137,7 @@ func (cache *FileCacheImpl) Open(name string) (*os.File, error) {
 	if item != nil {
 		return os.Open(item.Access())
 	}
-	return nil, ItemNotInCache
+	return nil, ErrItemNotInCache
 }
 
 func (cache *FileCacheImpl) Create(name string) (WritableFile, error) {
@@ -371,7 +372,7 @@ func (cache *FileCacheImpl) addItem(name string) (err error) {
 	}
 
 	if item.Size() > cache.MaxSize {
-		return ItemTooLarge
+		return ErrItemTooLarge
 	}
 
 	remainingCapacity := cache.MaxSize - cache.capacity
@@ -380,7 +381,7 @@ func (cache *FileCacheImpl) addItem(name string) (err error) {
 	}
 
 	if (purgeCount > 0 || purgeSize > 0) && !cache.expireOldest(purgeCount, purgeSize) {
-		return ItemTooLarge
+		return ErrItemTooLarge
 	}
 
 	cache.swapItem(name, item)
