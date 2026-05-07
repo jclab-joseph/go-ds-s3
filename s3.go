@@ -401,6 +401,8 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 			keyFromS3 := aws.ToString(resp.Contents[index].Key)
 			dsKeyPath := strings.TrimPrefix(keyFromS3, s.RootDirectory)
 			dsKeyPath = strings.TrimPrefix(dsKeyPath, "/")
+			dsKeyTokens := strings.Split(dsKeyPath, "/")
+			dsKeyPath = dsKeyTokens[len(dsKeyTokens)-1]
 
 			entry := dsq.Entry{
 				Key:  ds.NewKey(dsKeyPath).String(),
