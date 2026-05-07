@@ -12,25 +12,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/ipfs/boxo/datastore/dshelp"
 	"github.com/ipfs/go-cid"
-	"github.com/ipfs/go-ds-s3/pkg/filecache"
-	disk "github.com/ipfs/go-ds-s3/pkg/minio-disk"
-
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/credentials/ec2rolecreds"
-	"github.com/aws/aws-sdk-go/aws/credentials/endpointcreds"
-	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
-	"github.com/aws/aws-sdk-go/aws/defaults"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
-	"github.com/aws/aws-sdk-go/service/sts"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
+	"github.com/ipfs/go-ds-s3/pkg/filecache"
+	disk "github.com/ipfs/go-ds-s3/pkg/minio-disk"
 	logging "github.com/ipfs/go-log/v2"
 )
 
@@ -57,8 +53,17 @@ var (
 
 type S3Bucket struct {
 	Config
-	S3    s3iface.S3API
+	S3    s3API
 	Cache filecache.FileCache
+}
+
+type s3API interface {
+	PutObject(context.Context, *s3.PutObjectInput, ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	GetObject(context.Context, *s3.GetObjectInput, ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	HeadObject(context.Context, *s3.HeadObjectInput, ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObjects(context.Context, *s3.DeleteObjectsInput, ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 }
 
 type Config struct {
@@ -114,50 +119,23 @@ func NewS3Datastore(conf Config) (*S3Bucket, error) {
 		conf.Workers = defaultWorkers
 	}
 
-	awsConfig := aws.NewConfig()
-	sess, err := session.NewSession()
+	loadOptions := []func(*config.LoadOptions) error{}
+	if conf.Region != "" {
+		loadOptions = append(loadOptions, config.WithRegion(conf.Region))
+	}
+
+	awsConfig, err := config.LoadDefaultConfig(context.Background(), loadOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create new session: %s", err)
+		return nil, fmt.Errorf("failed to load AWS config: %s", err)
 	}
+	awsConfig.Credentials = newCredentialProvider(conf, awsConfig)
 
-	d := defaults.Get()
-	providers := []credentials.Provider{
-		&credentials.StaticProvider{Value: credentials.Value{
-			AccessKeyID:     conf.AccessKey,
-			SecretAccessKey: conf.SecretKey,
-			SessionToken:    conf.SessionToken,
-		}},
-		&credentials.EnvProvider{},
-		&credentials.SharedCredentialsProvider{},
-		&ec2rolecreds.EC2RoleProvider{Client: ec2metadata.New(sess)},
-		endpointcreds.NewProviderClient(*d.Config, d.Handlers, conf.CredentialsEndpoint,
-			func(p *endpointcreds.Provider) { p.ExpiryWindow = credsRefreshWindow },
-		),
-	}
-
-	if len(os.Getenv("AWS_ROLE_ARN")) > 0 && len(os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")) > 0 {
-		stsClient := sts.New(sess)
-		stsProvider := stscreds.NewWebIdentityRoleProviderWithOptions(stsClient, os.Getenv("AWS_ROLE_ARN"), "", stscreds.FetchTokenPath(os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")))
-		// prepend sts provider to list of providers
-		providers = append([]credentials.Provider{stsProvider}, providers...)
-	}
-
-	creds := credentials.NewChainCredentials(providers)
-
-	if conf.RegionEndpoint != "" {
-		awsConfig.WithS3ForcePathStyle(true)
-		awsConfig.WithEndpoint(conf.RegionEndpoint)
-	}
-
-	awsConfig.WithCredentials(creds)
-	awsConfig.CredentialsChainVerboseErrors = aws.Bool(true)
-	awsConfig.WithRegion(conf.Region)
-
-	sess, err = session.NewSession(awsConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create new session with aws config: %s", err)
-	}
-	s3obj := s3.New(sess)
+	s3obj := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
+		if conf.RegionEndpoint != "" {
+			o.BaseEndpoint = aws.String(conf.RegionEndpoint)
+			o.UsePathStyle = true
+		}
+	})
 
 	var cache filecache.FileCache
 	if conf.CacheDirectory != "" {
@@ -195,7 +173,7 @@ func (s *S3Bucket) Put(ctx context.Context, k ds.Key, value []byte) error {
 
 	key := prepareKey(s.Config, k)
 
-	_, err := s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
+	_, err := s.S3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.Bucket),
 		Key:    aws.String(s.s3Path(key)),
 		Body:   bytes.NewReader(value),
@@ -230,7 +208,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 
 	var body []byte
 	for index, key := range keys {
-		resp, err = s.S3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+		resp, err = s.S3.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(s.Bucket),
 			Key:    aws.String(s.s3Path(key)),
 		})
@@ -240,7 +218,7 @@ func (s *S3Bucket) Get(ctx context.Context, k ds.Key) ([]byte, error) {
 			resp.Body.Close()
 		}
 		if index == 1 && err == nil {
-			_, _ = s.S3.PutObjectWithContext(ctx, &s3.PutObjectInput{
+			_, _ = s.S3.PutObject(ctx, &s3.PutObjectInput{
 				Bucket: aws.String(s.Bucket),
 				Key:    aws.String(s.s3Path(prepareKey(s.Config, k))),
 				Body:   bytes.NewReader(body),
@@ -284,7 +262,7 @@ func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) 
 	keys := prepareKeyWithFallback(s.Config, k)
 
 	for _, key := range keys {
-		resp, err = s.S3.HeadObjectWithContext(ctx, &s3.HeadObjectInput{
+		resp, err = s.S3.HeadObject(ctx, &s3.HeadObjectInput{
 			Bucket: aws.String(s.Bucket),
 			Key:    aws.String(s.s3Path(key)),
 		})
@@ -299,7 +277,7 @@ func (s *S3Bucket) GetSize(ctx context.Context, k ds.Key) (size int, err error) 
 		log.Errorf("get size error on key %s: %v", k, err)
 		return -1, err
 	}
-	return int(aws.Int64Value(resp.ContentLength)), nil
+	return int(aws.ToInt64(resp.ContentLength)), nil
 }
 
 func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
@@ -311,7 +289,7 @@ func (s *S3Bucket) Delete(ctx context.Context, k ds.Key) error {
 	s.Cache.Remove(keys[0])
 
 	for _, key := range keys {
-		_, err = s.S3.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
+		_, err = s.S3.DeleteObject(ctx, &s3.DeleteObjectInput{
 			Bucket: aws.String(s.Bucket),
 			Key:    aws.String(s.s3Path(key)),
 		})
@@ -370,7 +348,7 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 	listInput := &s3.ListObjectsV2Input{
 		Bucket:  aws.String(s.Bucket),
 		Prefix:  aws.String(s.s3Path(prefix)),
-		MaxKeys: aws.Int64(listMax),
+		MaxKeys: aws.Int32(listMax),
 	}
 
 	// The iterator needs to be stateful across Next() calls.
@@ -388,7 +366,7 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 		// Initial fetch on first call
 		if !started {
 			log.Debugf("query: initial list call for prefix %s", q.Prefix)
-			resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
+			resp, err = s.S3.ListObjectsV2(ctx, listInput)
 			if err != nil {
 				log.Errorf("query: list objects error: %v", err)
 				return dsq.Result{Error: err}, false
@@ -404,7 +382,7 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 
 			// Do we need to fetch the next page of results?
 			for index >= len(resp.Contents) {
-				if !aws.BoolValue(resp.IsTruncated) {
+				if !aws.ToBool(resp.IsTruncated) {
 					log.Debug("query: end of results")
 					return dsq.Result{}, false
 				}
@@ -412,7 +390,7 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 				index = 0
 				listInput.ContinuationToken = resp.NextContinuationToken
 				log.Debugf("query: fetching next page with token %s", *resp.NextContinuationToken)
-				resp, err = s.S3.ListObjectsV2WithContext(ctx, listInput)
+				resp, err = s.S3.ListObjectsV2(ctx, listInput)
 				if err != nil {
 					log.Errorf("query: list objects error on next page: %v", err)
 					return dsq.Result{Error: err}, false
@@ -427,13 +405,13 @@ func (s *S3Bucket) Query(ctx context.Context, q dsq.Query) (dsq.Results, error) 
 			}
 
 			// If we are here, we have an entry to return.
-			keyFromS3 := aws.StringValue(resp.Contents[index].Key)
+			keyFromS3 := aws.ToString(resp.Contents[index].Key)
 			dsKeyPath := strings.TrimPrefix(keyFromS3, s.RootDirectory)
 			dsKeyPath = strings.TrimPrefix(dsKeyPath, "/")
 
 			entry := dsq.Entry{
 				Key:  ds.NewKey(dsKeyPath).String(),
-				Size: int(aws.Int64Value(resp.Contents[index].Size)),
+				Size: int(aws.ToInt64(resp.Contents[index].Size)),
 			}
 			if !q.KeysOnly {
 				value, getErr := s.Get(ctx, ds.NewKey(entry.Key))
@@ -480,9 +458,9 @@ func (s *S3Bucket) s3Path(p string) string {
 }
 
 func isNotFound(err error) bool {
-	var s3Err awserr.Error
-	ok := errors.As(err, &s3Err)
-	return ok && (s3Err.Code() == s3.ErrCodeNoSuchKey || s3Err.Code() == "NotFound")
+	var apiErr smithy.APIError
+	ok := errors.As(err, &apiErr)
+	return ok && (apiErr.ErrorCode() == "NoSuchKey" || apiErr.ErrorCode() == "NotFound")
 }
 
 type s3Batch struct {
@@ -517,12 +495,12 @@ func (b *s3Batch) Delete(ctx context.Context, k ds.Key) error {
 func (b *s3Batch) Commit(ctx context.Context) error {
 	log.Debugf("committing batch with %d operations", len(b.ops))
 	var (
-		deleteObjs []*s3.ObjectIdentifier
+		deleteObjs []s3types.ObjectIdentifier
 		putKeys    []ds.Key
 	)
 	for k, op := range b.ops {
 		if op.delete {
-			deleteObjs = append(deleteObjs, &s3.ObjectIdentifier{
+			deleteObjs = append(deleteObjs, s3types.ObjectIdentifier{
 				Key: aws.String(b.s.s3Path(k)),
 			})
 		} else {
@@ -594,12 +572,12 @@ func (b *s3Batch) newPutJob(ctx context.Context, k ds.Key, value []byte) func() 
 	}
 }
 
-func (b *s3Batch) newDeleteJob(ctx context.Context, objs []*s3.ObjectIdentifier) func() error {
+func (b *s3Batch) newDeleteJob(ctx context.Context, objs []s3types.ObjectIdentifier) func() error {
 	return func() error {
 		log.Debugf("batch worker: deleting %d objects", len(objs))
-		resp, err := b.s.S3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		resp, err := b.s.S3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(b.s.Bucket),
-			Delete: &s3.Delete{
+			Delete: &s3types.Delete{
 				Objects: objs,
 			},
 		})
@@ -610,11 +588,11 @@ func (b *s3Batch) newDeleteJob(ctx context.Context, objs []*s3.ObjectIdentifier)
 
 		var errs []string
 		for _, err := range resp.Errors {
-			if err.Code != nil && *err.Code == s3.ErrCodeNoSuchKey {
+			if err.Code != nil && *err.Code == "NoSuchKey" {
 				// idempotent
 				continue
 			}
-			errs = append(errs, err.String())
+			errs = append(errs, fmt.Sprintf("%s: %s", aws.ToString(err.Code), aws.ToString(err.Message)))
 		}
 
 		if len(errs) > 0 {
@@ -631,6 +609,59 @@ func worker(jobs <-chan func() error, results chan<- error) {
 	for j := range jobs {
 		results <- j()
 	}
+}
+
+func newCredentialProvider(conf Config, cfg aws.Config) aws.CredentialsProvider {
+	var providers []aws.CredentialsProvider
+
+	if roleARN, tokenFile := os.Getenv("AWS_ROLE_ARN"), os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE"); roleARN != "" && tokenFile != "" {
+		stsClient := sts.NewFromConfig(cfg)
+		providers = append(providers, aws.NewCredentialsCache(
+			stscreds.NewWebIdentityRoleProvider(stsClient, roleARN, stscreds.IdentityTokenFile(tokenFile)),
+			func(o *aws.CredentialsCacheOptions) {
+				o.ExpiryWindow = credsRefreshWindow
+			},
+		))
+	}
+
+	if conf.AccessKey != "" || conf.SecretKey != "" || conf.SessionToken != "" {
+		providers = append(providers, credentials.NewStaticCredentialsProvider(conf.AccessKey, conf.SecretKey, conf.SessionToken))
+	}
+
+	if cfg.Credentials != nil {
+		providers = append(providers, cfg.Credentials)
+	}
+
+	if conf.CredentialsEndpoint != "" {
+		providers = append(providers, aws.NewCredentialsCache(
+			endpointcreds.New(conf.CredentialsEndpoint),
+			func(o *aws.CredentialsCacheOptions) {
+				o.ExpiryWindow = credsRefreshWindow
+			},
+		))
+	}
+
+	if len(providers) == 1 {
+		return providers[0]
+	}
+
+	return aws.CredentialsProviderFunc(func(ctx context.Context) (aws.Credentials, error) {
+		var errs []string
+		for _, provider := range providers {
+			creds, err := provider.Retrieve(ctx)
+			if err == nil && creds.HasKeys() {
+				return creds, nil
+			}
+			if err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
+
+		if len(errs) == 0 {
+			return aws.Credentials{}, errors.New("failed to retrieve AWS credentials")
+		}
+		return aws.Credentials{}, fmt.Errorf("failed to retrieve AWS credentials: %s", strings.Join(errs, "; "))
+	})
 }
 
 var _ ds.Batching = (*S3Bucket)(nil)
