@@ -3,6 +3,7 @@ package s3ds
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,15 +11,16 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3iface"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
 	dstest "github.com/ipfs/go-datastore/test"
+	"github.com/ipfs/go-ds-s3/pkg/filecache"
 )
 
 func TestSuiteLocalS3(t *testing.T) {
@@ -29,12 +31,18 @@ func TestSuiteLocalS3(t *testing.T) {
 		t.Skipf("skipping test suite; LOCAL_S3 is not set.")
 	}
 
+	localBucketName, localBucketNameSet := os.LookupEnv("LOCAL_BUCKET_NAME")
+	if !localBucketNameSet {
+		localBucketName = fmt.Sprintf("localbucketname%d", time.Now().UnixNano())
+	}
+
 	config := Config{
 		RegionEndpoint: "http://localhost:9000",
-		Bucket:         "localbucketname",
+		Bucket:         localBucketName,
 		Region:         "local",
 		AccessKey:      "test",
 		SecretKey:      "testdslocal",
+		KeyTransform:   "default",
 	}
 
 	s3ds, err := NewS3Datastore(config)
@@ -42,7 +50,11 @@ func TestSuiteLocalS3(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = devMakeBucket(s3ds.S3.(*s3.S3), "localbucketname"); err != nil {
+	bucketClient, ok := s3ds.S3.(testBucketClient)
+	if !ok {
+		t.Fatalf("unexpected S3 client type %T", s3ds.S3)
+	}
+	if err = devMakeBucket(bucketClient, localBucketName); err != nil {
 		t.Fatal(err)
 	}
 
@@ -60,27 +72,30 @@ func TestSuiteLocalS3(t *testing.T) {
 	})
 }
 
-func devMakeBucket(s3obj *s3.S3, bucketName string) error {
-	s3obj.DeleteBucket(&s3.DeleteBucketInput{
+type testBucketClient interface {
+	DeleteBucket(context.Context, *s3.DeleteBucketInput, ...func(*s3.Options)) (*s3.DeleteBucketOutput, error)
+	CreateBucket(context.Context, *s3.CreateBucketInput, ...func(*s3.Options)) (*s3.CreateBucketOutput, error)
+}
+
+func devMakeBucket(s3obj testBucketClient, bucketName string) error {
+	_, _ = s3obj.DeleteBucket(context.Background(), &s3.DeleteBucketInput{
 		Bucket: aws.String(bucketName),
 	})
-	_, err := s3obj.CreateBucket(&s3.CreateBucketInput{
+	_, err := s3obj.CreateBucket(context.Background(), &s3.CreateBucketInput{
 		Bucket: aws.String(bucketName),
 	})
 
 	return err
 }
 
-// mockS3Client is a mock implementation of the s3iface.S3API for testing.
 type mockS3Client struct {
-	s3iface.S3API
 	sync.RWMutex
 	objects      map[string][]byte
 	listPageSize int
 	failGet      error
 }
 
-func (m *mockS3Client) PutObjectWithContext(ctx aws.Context, input *s3.PutObjectInput, opts ...request.Option) (*s3.PutObjectOutput, error) {
+func (m *mockS3Client) PutObject(ctx context.Context, input *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
 	m.Lock()
 	defer m.Unlock()
 	buf, err := io.ReadAll(input.Body)
@@ -91,7 +106,7 @@ func (m *mockS3Client) PutObjectWithContext(ctx aws.Context, input *s3.PutObject
 	return &s3.PutObjectOutput{}, nil
 }
 
-func (m *mockS3Client) GetObjectWithContext(ctx aws.Context, input *s3.GetObjectInput, opts ...request.Option) (*s3.GetObjectOutput, error) {
+func (m *mockS3Client) GetObject(ctx context.Context, input *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	if m.failGet != nil {
 		return nil, m.failGet
 	}
@@ -99,7 +114,7 @@ func (m *mockS3Client) GetObjectWithContext(ctx aws.Context, input *s3.GetObject
 	defer m.RUnlock()
 	data, ok := m.objects[*input.Key]
 	if !ok {
-		return nil, awserr.New(s3.ErrCodeNoSuchKey, "not found", nil)
+		return nil, &smithy.GenericAPIError{Code: "NoSuchKey", Message: "not found"}
 	}
 	return &s3.GetObjectOutput{
 		Body:          io.NopCloser(bytes.NewReader(data)),
@@ -107,26 +122,26 @@ func (m *mockS3Client) GetObjectWithContext(ctx aws.Context, input *s3.GetObject
 	}, nil
 }
 
-func (m *mockS3Client) HeadObjectWithContext(ctx aws.Context, input *s3.HeadObjectInput, opts ...request.Option) (*s3.HeadObjectOutput, error) {
+func (m *mockS3Client) HeadObject(ctx context.Context, input *s3.HeadObjectInput, opts ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
 	m.RLock()
 	defer m.RUnlock()
 	data, ok := m.objects[*input.Key]
 	if !ok {
-		return nil, awserr.New("NotFound", "not found", nil)
+		return nil, &smithy.GenericAPIError{Code: "NotFound", Message: "not found"}
 	}
 	return &s3.HeadObjectOutput{
 		ContentLength: aws.Int64(int64(len(data))),
 	}, nil
 }
 
-func (m *mockS3Client) DeleteObjectWithContext(ctx aws.Context, input *s3.DeleteObjectInput, opts ...request.Option) (*s3.DeleteObjectOutput, error) {
+func (m *mockS3Client) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput, opts ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
 	m.Lock()
 	defer m.Unlock()
 	delete(m.objects, *input.Key)
 	return &s3.DeleteObjectOutput{}, nil
 }
 
-func (m *mockS3Client) ListObjectsV2WithContext(ctx aws.Context, input *s3.ListObjectsV2Input, opts ...request.Option) (*s3.ListObjectsV2Output, error) {
+func (m *mockS3Client) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -164,9 +179,9 @@ func (m *mockS3Client) ListObjectsV2WithContext(ctx aws.Context, input *s3.ListO
 		end = len(allMatchingKeys)
 	}
 
-	var contents []*s3.Object
+	var contents []s3types.Object
 	for _, k := range allMatchingKeys[start:end] {
-		contents = append(contents, &s3.Object{
+		contents = append(contents, s3types.Object{
 			Key:  aws.String(k),
 			Size: aws.Int64(int64(len(m.objects[k]))),
 		})
@@ -179,19 +194,19 @@ func (m *mockS3Client) ListObjectsV2WithContext(ctx aws.Context, input *s3.ListO
 	}, nil
 }
 
-func (m *mockS3Client) DeleteObjectsWithContext(ctx aws.Context, input *s3.DeleteObjectsInput, opts ...request.Option) (*s3.DeleteObjectsOutput, error) {
+func (m *mockS3Client) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput, opts ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
 	m.Lock()
 	defer m.Unlock()
-	var deleted []*s3.DeletedObject
-	var errors []*s3.Error
+	var deleted []s3types.DeletedObject
+	var errors []s3types.Error
 	for _, obj := range input.Delete.Objects {
 		if _, ok := m.objects[*obj.Key]; ok {
 			delete(m.objects, *obj.Key)
-			deleted = append(deleted, &s3.DeletedObject{Key: obj.Key})
+			deleted = append(deleted, s3types.DeletedObject{Key: obj.Key})
 		} else {
-			errors = append(errors, &s3.Error{
+			errors = append(errors, s3types.Error{
 				Key:     obj.Key,
-				Code:    aws.String(s3.ErrCodeNoSuchKey),
+				Code:    aws.String("NoSuchKey"),
 				Message: aws.String("The specified key does not exist."),
 			})
 		}
@@ -210,9 +225,11 @@ func newMockS3Datastore(t *testing.T) (*S3Bucket, *mockS3Client) {
 	s3ds := &S3Bucket{
 		S3: mockS3,
 		Config: Config{
-			Bucket:  "test-bucket",
-			Workers: 10,
+			Bucket:       "test-bucket",
+			Workers:      10,
+			KeyTransform: "default",
 		},
+		Cache: filecache.NewNoop(),
 	}
 	return s3ds, mockS3
 }
@@ -367,19 +384,20 @@ func TestQueryWithOffset(t *testing.T) {
 
 func TestGetError(t *testing.T) {
 	s3ds, mockS3 := newMockS3Datastore(t)
-	mockS3.failGet = awserr.New("InternalError", "something broke", nil)
+	mockS3.failGet = &smithy.GenericAPIError{Code: "InternalError", Message: "something broke"}
 
 	_, err := s3ds.Get(context.Background(), ds.NewKey("anykey"))
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
 
-	awsErr, ok := err.(awserr.Error)
+	var awsErr smithy.APIError
+	ok := errors.As(err, &awsErr)
 	if !ok {
-		t.Fatalf("expected awserr.Error, got %T", err)
+		t.Fatalf("expected smithy.APIError, got %T", err)
 	}
-	if awsErr.Code() != "InternalError" {
-		t.Errorf("unexpected error code: got %s, want InternalError", awsErr.Code())
+	if awsErr.ErrorCode() != "InternalError" {
+		t.Errorf("unexpected error code: got %s, want InternalError", awsErr.ErrorCode())
 	}
 }
 

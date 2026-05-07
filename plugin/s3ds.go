@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"fmt"
+	"reflect"
 
 	s3ds "github.com/ipfs/go-ds-s3"
 	"github.com/ipfs/kubo/plugin"
@@ -98,6 +99,38 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 			}
 		}
 
+		keyTransform := "default"
+		if v, ok := m["keyTransform"]; ok {
+			if v != "" {
+				keyTransform, ok = v.(string)
+				if !ok {
+					return nil, fmt.Errorf("s3ds: keyTransform is not a valid key transform method")
+				}
+			}
+		}
+
+		var cacheDirectory string
+		if v, ok := m["cacheDirectory"]; ok {
+			cacheDirectory, ok = v.(string)
+			if !ok {
+				return nil, fmt.Errorf("s3ds: cacheDirectory not a string")
+			}
+		}
+
+		var cacheCapacity int64 = 0
+		if v, ok := m["cacheCapacity"]; ok {
+			switch typed := v.(type) {
+			case int:
+				cacheCapacity = int64(typed)
+			case int64:
+				cacheCapacity = typed
+			case float64:
+				cacheCapacity = int64(typed)
+			default:
+				return nil, fmt.Errorf("s3ds: cacheCapacity not a integer: %s", reflect.TypeOf(v))
+			}
+		}
+
 		return &S3Config{
 			cfg: s3ds.Config{
 				Region:              region,
@@ -109,6 +142,9 @@ func (s3p S3Plugin) DatastoreConfigParser() fsrepo.ConfigFromMap {
 				Workers:             workers,
 				RegionEndpoint:      endpoint,
 				CredentialsEndpoint: credentialsEndpoint,
+				KeyTransform:        keyTransform,
+				CacheDirectory:      cacheDirectory,
+				CacheCapacity:       cacheCapacity,
 			},
 		}, nil
 	}
@@ -123,6 +159,7 @@ func (s3c *S3Config) DiskSpec() fsrepo.DiskSpec {
 		"region":        s3c.cfg.Region,
 		"bucket":        s3c.cfg.Bucket,
 		"rootDirectory": s3c.cfg.RootDirectory,
+		"keyTransform":  s3c.cfg.KeyTransform,
 	}
 }
 

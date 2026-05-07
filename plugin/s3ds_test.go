@@ -22,10 +22,11 @@ func TestS3PluginDatastoreConfigParser(t *testing.T) {
 				"secretKey": "somesecretkey",
 			},
 			Want: &S3Config{cfg: s3ds.Config{
-				Region:    "someregion",
-				Bucket:    "somebucket",
-				AccessKey: "someaccesskey",
-				SecretKey: "somesecretkey",
+				Region:       "someregion",
+				Bucket:       "somebucket",
+				AccessKey:    "someaccesskey",
+				SecretKey:    "somesecretkey",
+				KeyTransform: "default",
 			}},
 		},
 		{
@@ -47,6 +48,7 @@ func TestS3PluginDatastoreConfigParser(t *testing.T) {
 				"regionEndpoint":      "someendpoint",
 				"workers":             42.0,
 				"credentialsEndpoint": "somecredendpoint",
+				"keyTransform":        "default",
 			},
 			Want: &S3Config{cfg: s3ds.Config{
 				Region:              "someregion",
@@ -58,6 +60,7 @@ func TestS3PluginDatastoreConfigParser(t *testing.T) {
 				RegionEndpoint:      "someendpoint",
 				Workers:             42,
 				CredentialsEndpoint: "somecredendpoint",
+				KeyTransform:        "default",
 			}},
 		},
 	}
